@@ -20,10 +20,6 @@ AddAccountDialog::AddAccountDialog(QWidget *parent) :
     ui->deviceIdentityRadio->setChecked(true);
     connect(ui->identityFileRadio, &QRadioButton::toggled, this, &AddAccountDialog::updateIdentitySource);
     updateIdentitySource();
-
-    // Every account gets its own installation id; clearing the field falls
-    // back to the Gameforge client's own id.
-    ui->installationIdLineEdit->setText(QUuid::createUuid().toString(QUuid::WithoutBraces));
 }
 
 AddAccountDialog::~AddAccountDialog()

@@ -64,21 +64,28 @@ BlackboxExtractor.exe --json --once --timeout 600
 {"event": "attached", "pid": 1234}
 {"event": "spawned", "pid": 1234}
 {"event": "waiting"}
+{"event": "reattaching", "detail": "process-terminated"}
 {"event": "blackbox", "blackbox": "tra:...", "path": "/api/v1/auth/sessions"}
 {"event": "error", "detail": "..."}
 ```
 
 `attached` or `spawned` comes first, then `waiting` once the hook is loaded. An `error` event is printed for every
-failure that ends the run with code 2, when `gfclient.exe` closes, and for a request whose blackbox could not be
-decoded (the extractor keeps waiting in that case).
+failure that ends the run with code 2 (an unexpected internal error included), when `gfclient.exe` closed and no new
+one appeared, and for a request whose blackbox could not be decoded (the extractor keeps waiting in that case).
+
+The Gameforge client may update or restart itself when it starts; the extractor waits for it. When `gfclient.exe` goes
+away, `reattaching` is printed with the reason, and for up to 90 s (never past `--timeout`) the extractor looks for a
+new `gfclient.exe` every 2 s. Once it is found the hook is loaded again and `attached` and `waiting` follow. Only when
+no new client appears in time does the run end with an `error` event and code 1. Re-attaching never starts a client,
+also without `--no-spawn`.
 
 ### Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | 0 | At least one blackbox was captured. |
-| 1 | Nothing captured (timeout, Ctrl+C, or `gfclient.exe` closed). |
-| 2 | Could not attach to or start `gfclient.exe`, or could not load the agent script. |
+| 1 | Nothing captured (timeout, Ctrl+C, or `gfclient.exe` closed and no new one appeared within 90 s). |
+| 2 | Could not attach to or start `gfclient.exe`, could not load the agent script, or an unexpected error (its traceback goes to stderr). |
 
 ## Tests
 
@@ -86,7 +93,7 @@ No Frida or game client needed:
 
 ```bash
 npm test         # the request reassembly (src/collector.ts)
-npm run test:py  # the blackbox decoding (src/blackbox_decode.py), same as:
+npm run test:py  # the blackbox decoding and the attach / re-attach loop (src/client.py, fake frida), same as:
 .venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
 ```
 

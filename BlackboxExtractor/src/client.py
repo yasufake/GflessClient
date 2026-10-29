@@ -7,16 +7,22 @@ import json
 import subprocess
 import threading
 import time
+import traceback
 
 from blackbox_decode import decode_request
 
 # Exit codes (also documented in README.md).
 EXIT_CAPTURED = 0       # at least one blackbox was captured
-EXIT_NOTHING = 1        # nothing captured (timeout, Ctrl+C, gfclient.exe closed)
-EXIT_FAILED = 2         # could not attach, spawn or load the agent script
+EXIT_NOTHING = 1        # nothing captured (timeout, Ctrl+C, gfclient.exe closed for good)
+EXIT_FAILED = 2         # could not attach, spawn or load the agent script; unexpected error
 
 # How often the waiting loop wakes up to check the timeout and Ctrl+C.
 POLL_SECONDS = 0.25
+
+# After gfclient.exe went away (it closed, updated or re-executed itself), how
+# long to wait for a new one and how often to look for it.
+REATTACH_SECONDS = 90
+REATTACH_POLL_SECONDS = 2
 
 
 class Output:
@@ -233,11 +239,104 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> int:
-    _make_streams_safe()
-    args = parse_args()
-    out = Output(args.json)
+def _is_detached(session: Session) -> bool:
+    try:
+        return bool(session.is_detached)
+    except Exception:
+        return False
 
+
+def _release(session: Session, capture: Capture) -> None:
+    """Detach on purpose, without reporting it as the client going away."""
+    try:
+        session.off("detached", capture.on_detached)
+    except Exception:
+        pass
+    try:
+        session.detach()
+    except Exception:
+        pass
+
+
+def _attach_script(session: Session, script_code: str, capture: Capture, out: Output) -> bool:
+    """Load the agent into the attached gfclient.exe; return False on failure.
+
+    When the client went away while the agent was loading (it updates or
+    re-executes itself right after starting), capture.detach_reason is set so
+    the caller can wait for the new client instead of giving up.
+    """
+    try:
+        session.on("detached", capture.on_detached)
+        script = session.create_script(script_code)
+        script.set_log_handler(out.agent_log)
+        script.on("message", capture.on_message)
+        script.load()
+        return True
+    except Exception as e:
+        failure = f"{type(e).__name__}: {e}"
+        if capture.detach_reason is None and _is_detached(session):
+            capture.detach_reason = "detached while the agent was loading"
+        if capture.detach_reason is not None:
+            # Not final: the waiting loop looks for the new client.
+            out.log(f"[-] gfclient.exe went away while the agent was loading ({failure})")
+        else:
+            out.error(f"could not load the agent into gfclient.exe ({failure})")
+        _release(session, capture)
+        return False
+
+
+def _announce_waiting(out: Output) -> None:
+    out.log("[+] Script loaded successfully")
+    out.log("[*] Waiting for auth requests: press Play in the Gameforge client...")
+    out.log("[*] Press Ctrl+C to exit\n")
+    out.event("waiting")
+
+
+def _reattach(capture: Capture, script_code: str, out: Output, deadline: float | None) -> Session | None:
+    """Wait for a new gfclient.exe after the previous one went away.
+
+    The Gameforge client may update or restart itself when it starts. Polls for
+    a new process for up to REATTACH_SECONDS (never past the overall deadline)
+    and loads the agent into it. Attach only: a second client is never spawned.
+    Returns the new session, or None after an error event when none appeared.
+    """
+    reason = capture.detach_reason
+    started = time.monotonic()
+    give_up = started + REATTACH_SECONDS
+    if deadline is not None:
+        give_up = min(give_up, deadline)
+
+    out.log(f"[*] gfclient.exe went away ({reason}); waiting up to {REATTACH_SECONDS:g} s for it to come back...")
+    out.event("reattaching", detail=reason)
+
+    while True:
+        try:
+            session = frida.attach("gfclient.exe")
+        except Exception:
+            session = None
+
+        if session is not None:
+            # A detach of the new client while the agent loads sets it again.
+            capture.detach_reason = None
+            if _attach_script(session, script_code, capture, out):
+                out.log(f"[+] Attached to the new gfclient.exe process (PID: {session.pid})")
+                out.event("attached", pid=session.pid)
+                _announce_waiting(out)
+                return session
+            reason = capture.detach_reason or reason
+
+        remaining = give_up - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(REATTACH_POLL_SECONDS, remaining))
+
+    capture.detach_reason = reason
+    waited = time.monotonic() - started
+    out.error(f"Detached from gfclient.exe ({reason}) and no new client appeared in {waited:.0f} s")
+    return None
+
+
+def _run(args: argparse.Namespace, out: Output) -> int:
     script_path = _find_script()
     if not script_path:
         out.error("Script file 'build/agent.js' not found; run 'npm run build' first")
@@ -264,25 +363,11 @@ def main() -> int:
         out.event("spawned", pid=session.pid)
 
     capture = Capture(out)
-    session.on("detached", capture.on_detached)
-    script = session.create_script(script_code)
-    script.set_log_handler(out.agent_log)
-    script.on("message", capture.on_message)
-
-    try:
-        script.load()
-    except Exception as e:
-        out.error(f"Error loading script: {e}")
-        try:
-            session.detach()
-        except Exception:
-            pass
+    if _attach_script(session, script_code, capture, out):
+        _announce_waiting(out)
+    elif capture.detach_reason is None:
         return EXIT_FAILED
-
-    out.log("[+] Script loaded successfully")
-    out.log("[*] Waiting for auth requests: press Play in the Gameforge client...")
-    out.log("[*] Press Ctrl+C to exit\n")
-    out.event("waiting")
+    # Otherwise the client went away while loading: the loop below re-attaches.
 
     # Poll an event instead of blocking on stdin: a GUI running the helper
     # through a pipe may never close stdin, and short waits keep Ctrl+C working.
@@ -292,8 +377,11 @@ def main() -> int:
             if args.once and capture.count > 0:
                 break
             if capture.detach_reason is not None:
-                out.error(f"Detached from gfclient.exe ({capture.detach_reason})")
-                break
+                new_session = _reattach(capture, script_code, out, deadline)
+                if new_session is None:
+                    break
+                session = new_session
+                continue
             wait = POLL_SECONDS
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -314,6 +402,21 @@ def main() -> int:
                 pass
 
     return EXIT_CAPTURED if capture.count > 0 else EXIT_NOTHING
+
+
+def main() -> int:
+    _make_streams_safe()
+    args = parse_args()
+    out = Output(args.json)
+
+    try:
+        return _run(args, out)
+    except Exception as e:
+        # Never die with only a traceback: a program running the helper reads
+        # the error event; the traceback stays on stderr for bug reports.
+        traceback.print_exc(file=sys.stderr)
+        out.error(f"unexpected error: {type(e).__name__}: {e}")
+        return EXIT_FAILED
 
 
 if __name__ == "__main__":

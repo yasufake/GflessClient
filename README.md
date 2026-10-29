@@ -15,7 +15,7 @@ For help and more in-depth tutorials, join the Discord server.
 * Log in with Gameforge credentials or an existing authentication token.
 * Use a different identity (fingerprint) and installation ID for each Gameforge account.
 * One device identity per PC, captured once from the Gameforge client with a single manual step (`Options > Capture device identity...`); every account gets its own copy of it.
-* Add an account with just email, password and proxy: the identity file is optional and a random installation ID is pre-filled (editable).
+* Add an account with just email, password and proxy: the identity file and the installation ID are optional (the **Generate** button creates a random installation ID).
 * Add accounts with SOCKS5 proxy support (per-account IP, port, username, password).
 
 ### Profile System
@@ -75,6 +75,10 @@ Gameforge expects the identity (fingerprint) of your PC as the Gameforge client 
 4. Gfless saves the identity to `%APPDATA%\Hatz Nostale\Gfless Client\identities\device.json` and offers to close the Gameforge client, which must be closed before Gfless opens game clients.
 
 Every account added with the device identity gets its own copy of it (`identities\<email>.json`), so capturing a new device identity later does not change the accounts already added. Choosing an identity file in the **Add account** dialog is optional now.
+
+The installation ID is optional too: leave it empty to use the Gameforge client's own one, or click **Generate** in the **Add account** dialog to give the account a random one.
+
+If a capture fails, the details of the last attempt are in `%APPDATA%\Hatz Nostale\Gfless Client\identities\capture-last.log`; include that file when you report the problem.
 
 ### Manual identity file (fallback)
 
